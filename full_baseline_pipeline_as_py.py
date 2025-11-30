@@ -105,6 +105,7 @@ def get_project_paths(user_profile, use_small=True):
 
     mean_cache_folder_name = "mean_cached_images"
     diff_cache_folder_name = "diff_cached_images"
+    rel_diff_cache_folder_name = "rel_diff_cached_images"
 
     # Build Full Paths using '/'' operator with logic: Root / Subfolder / Filename (Pathlib magic)
     train_csv_path = root / config["csv_dir"] / train_csv_name
@@ -117,8 +118,10 @@ def get_project_paths(user_profile, use_small=True):
     mean_cache_path = root / config["cached_images"] / mean_cache_folder_name
     # Diff Cache Path: .../downloaded_data_small/diff_cache_images
     diff_cache_path = root / config["cached_images"] / diff_cache_folder_name
+    # Relative Diff Cache Path: .../downloaded_data_small/rel_diff_cache_images
+    rel_diff_cache_path = root / config["cached_images"] / rel_diff_cache_folder_name
 
-    return train_csv_path, val_csv_path, video_root_path, mean_cache_path, diff_cache_path
+    return train_csv_path, val_csv_path, video_root_path, mean_cache_path, diff_cache_path, rel_diff_cache_path
 
 
 # -----------------------------
@@ -367,6 +370,155 @@ class JesterDiffBaselineDataset(Dataset):
             img = torch.abs(img - first_img)
 
             tensors.append(img)
+
+        # stack all frames. so  shape (32, 3, H, W)
+        stacked_video = torch.stack(tensors)
+        # getting the mean along "Time", resulting in a shape of (3, H, W)
+        mean_image = torch.mean(stacked_video, dim=0)
+
+        # CACHE SAVE: saving the result so we never have to calculate it again
+        if self.cache_dir:
+            # torch.save(mean_image, cache_path)  # saves a .pt file, which is much fater for torch to load in the CACHE PATH
+
+            if not os.path.exists(cache_path):
+                # Write to a temporary file first
+                tmp_path = cache_path + ".tmp"
+
+                try:
+                    # Save to temp file
+                    torch.save(mean_image, tmp_path)
+
+                    # Atomic replace ensures only one worker succeeds
+                    os.replace(tmp_path, cache_path)
+
+                except FileExistsError:
+                    # Another worker beat us to it. Safe to ignore.
+                    pass
+                except Exception as e:
+                    # Clean up partial file if something went wrong
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except:
+                            pass
+                    print(f"Cache save error for {video_id}: {e}")
+
+        return mean_image, label
+
+# --------------------------------
+
+class JesterRelDiffBaselineDataset(Dataset):
+    def __init__(self, data_root, annotation_file, transform=None,
+                 text_label_dict=None, trim_percent=0.3, cache_dir=None):
+        """
+        Args:
+            cache_dir (str): Path to a folder where .pt files will be saved.
+                             If None, caching is disabled.
+        """
+        self.cache_dir = cache_dir
+
+        # Create cache directory if it's enabled and doesn't exist
+        if self.cache_dir is not None:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            print(f"Dataset Caching Enabled. Saving .pt files to: {self.cache_dir}")
+
+        self.data_root = data_root
+        self.transform = transform
+        self.trim_percent = trim_percent  # effectively trims the images by 2 * trim_percent. This is done to
+        # keep mostly relevant frames from the image, as usually the first trim_percent frames is the
+        # subject starring at the camera, motionless, and so are the last trim_percent frames, making
+        # the output image noisy, or motionless
+
+        # load CSV data
+        df = pd.read_csv(annotation_file, sep=';', header=None, names=['video_id', 'label'])
+        self.video_ids = df['video_id'].astype(str).tolist()
+        raw_labels = df['label'].tolist()
+
+        # id_to_label_map for future lookup of predictions (so we can see what the model predicts in language. not numbers)
+        self.id_to_label_map = pd.Series(df.label.values, index=df.video_id).to_dict()
+
+        if text_label_dict is not None:
+            self.class_to_idx = text_label_dict
+        else:
+            # creates the gesture: numeric_label map, from the gestures in train. This will be important for Validation later
+            unique_labels = sorted(list(set(raw_labels)))
+            self.class_to_idx = {label: i for i, label in enumerate(unique_labels)}
+
+        self.labels = [self.class_to_idx[l] for l in raw_labels]
+
+    def __len__(self):
+        return len(self.video_ids)
+
+    def __getitem__(self, idx):
+        # print(f"Attempting to load {idx}")
+        video_id = self.video_ids[idx]
+        label = self.labels[idx]
+
+        # CACHE PATH: if caching is on, check if we already did the work for this video: saves us A LOT of compute
+        if self.cache_dir:
+            cache_path = os.path.join(self.cache_dir, f"{video_id}.pt")
+            if os.path.exists(cache_path):
+                # print(f"Loading {idx} from cache")
+                # FAST PATH: Load tensor directly
+                mean_image = torch.load(cache_path)
+                return mean_image, label
+
+        # SLOW PATH: Calculate from scratch
+        video_dir = os.path.join(self.data_root, video_id)
+
+        try:
+            frame_names = sorted([x for x in os.listdir(video_dir) if x.endswith('.jpg')])
+            # debugging: seeing how many frames there are at the beginning
+            # print(f"Video {video_id}: First={frame_names[0]}, Last={frame_names[-1]}")
+        except FileNotFoundError:
+            print("missed some image")
+            return torch.zeros(1), label
+
+        total_frames = len(frame_names)
+
+        # Image trimming
+        # calculate how many frames to drop from each side
+        cut_amount = int(total_frames * self.trim_percent)
+        # it keeps everything if cut is 0.0 (means there aren't enough images to cut trim_percent*2 from)
+        if cut_amount > 0:
+            # revert to keeping only the middle frame if we cut too much (trim_percent >= 0.5)
+            if (total_frames - (2 * cut_amount)) <= 0:
+                mid = total_frames // 2
+                frame_names = [frame_names[mid]]
+            else:
+                # trim it up
+                frame_names = frame_names[cut_amount : -cut_amount]
+
+
+        # self.frames_available = len(frame_names)
+        # debugging: seeing how many images are left, from how many there were (previous print)
+        # print(f"Video {video_id}: First={frame_names[0]}, Last={frame_names[-1]}")
+
+        img_path = os.path.join(video_dir, frame_names[0])
+
+        with Image.open(img_path) as img:
+            img = img.convert("RGB")
+
+        # Resize/ToTensor happen here
+        if self.transform:
+            previous_img = self.transform(img)
+        # Loading and Transforming the remaining frames
+        tensors = []
+        for frame_name in frame_names[1:]:
+            img_path = os.path.join(video_dir, frame_name)
+
+            with Image.open(img_path) as img:
+                img = img.convert("RGB")
+
+            # Resize/ToTensor happen here
+            if self.transform:
+                img = self.transform(img)
+
+            subtracted_img = torch.abs(img - previous_img)
+
+            tensors.append(subtracted_img)
+
+            previous_img = img
 
         # stack all frames. so  shape (32, 3, H, W)
         stacked_video = torch.stack(tensors)
@@ -668,18 +820,22 @@ def train_model(model, train_loader, test_loader, device, num_epochs=20, lr=0.00
 
 if __name__ == "__main__":
     # to be ran once for the whole project
-    train_annotation, val_annotation, video_root, mean_cache_root, diff_cache_root = get_project_paths(CURRENT_USER, USE_SMALL_DATA)
+    train_annotation, val_annotation, video_root, mean_cache_root, diff_cache_root, rel_diff_cache_root = get_project_paths(
+        CURRENT_USER, USE_SMALL_DATA)
 
     # DEBUG CHECK
     print(f"User: {CURRENT_USER}")
     print(f"Train CSV:  {train_annotation}")
     print(f"Video Root: {video_root}")
+    print(f"Mean cache Root: {mean_cache_root}")
+    print(f"Diff cache Root: {diff_cache_root}")
     print(
         f"Exists?     {train_annotation.exists()} (CSV), {video_root.exists()} (Video Dir), {mean_cache_root.exists()} (mean_cached Dir)")
     # .exists is a Pathlib method
 
-    train_annotation, val_annotation, video_root, mean_cache_root = str(train_annotation), str(val_annotation), str(
-        video_root), str(mean_cache_root)
+    train_annotation, val_annotation, video_root, mean_cache_root, diff_cache_root, rel_diff_cache_root = str(
+        train_annotation), str(val_annotation), str(video_root), str(mean_cache_root), str(diff_cache_root), str(
+        rel_diff_cache_root)
 
 
     trim_percent = 0.3  # found empirically to yield the best outputs (clearest shadows and images)
@@ -710,25 +866,47 @@ if __name__ == "__main__":
     #     cache_dir=mean_cache_root
     # )
 
-    baseline_data_train = JesterDiffBaselineDataset(
+
+    # baseline_data_train = JesterDiffBaselineDataset(
+    #     data_root=video_root,
+    #     annotation_file=train_annotation,
+    #     transform=transform,
+    #     trim_percent=trim_percent,
+    #     cache_dir=diff_cache_root
+    # )
+    #
+    # # label map learned (generated) from the train videos: e.g. "Stop sign" is 1, and so on
+    # label_map = baseline_data_train.class_to_idx
+    #
+    # baseline_data_valid = JesterDiffBaselineDataset(
+    #     data_root=video_root,
+    #     annotation_file=val_annotation,
+    #     transform=transform,
+    #     text_label_dict=label_map,
+    #     # so the Validation loader does not generate new ones and turn everything on its head
+    #     trim_percent=trim_percent,
+    #     cache_dir=diff_cache_root
+    # )
+
+    baseline_data_train = JesterRelDiffBaselineDataset(
         data_root=video_root,
         annotation_file=train_annotation,
         transform=transform,
         trim_percent=trim_percent,
-        cache_dir=diff_cache_root
+        cache_dir=rel_diff_cache_root
     )
 
     # label map learned (generated) from the train videos: e.g. "Stop sign" is 1, and so on
     label_map = baseline_data_train.class_to_idx
 
-    baseline_data_valid = JesterDiffBaselineDataset(
+    baseline_data_valid = JesterRelDiffBaselineDataset(
         data_root=video_root,
         annotation_file=val_annotation,
         transform=transform,
         text_label_dict=label_map,
         # so the Validation loader does not generate new ones and turn everything on its head
         trim_percent=trim_percent,
-        cache_dir=diff_cache_root
+        cache_dir=rel_diff_cache_root
     )
 
     # if train_annotation, then val_annotation works too. This has to return SUCCESS, otherwise the class cannot access the data locations
