@@ -21,6 +21,8 @@ import random
 
 # optional (I just like the summary output; install if you want with either pip or conda the package "torchsummary")
 from torchsummary import summary
+from zmq.backend import first
+
 
 # ----------------------------
 
@@ -41,7 +43,7 @@ def worker_init_fn(worker_id):
     random.seed(worker_seed)
     torch.manual_seed(worker_seed)
 
-
+# master_seed = random.randint(0,100) # For debugging purposes, select a random seed
 master_seed = 42
 set_seed(master_seed)
 # defining generator
@@ -129,7 +131,8 @@ def get_project_paths(user_profile, use_small=True):
 
 class Jester3DConvDataset(Dataset):
     def __init__(self, data_root, annotation_file, transform=None,
-                 text_label_dict=None, trim_percent=0.3, cache_dir=None):
+                 text_label_dict=None, trim_percent=0.3, cache_dir=None, 
+                 num_target_frames = 20, frame_skips=1, diff_type=False):
         """
         Args:
             cache_dir (str): Path to a folder where .pt files will be saved.
@@ -145,6 +148,14 @@ class Jester3DConvDataset(Dataset):
         self.data_root = data_root
         self.transform = transform
         self.trim_percent = trim_percent  # effectively trims the images by 2 * trim_percent. This is done to
+        
+        self.num_target_frames = num_target_frames # Adds padding or removes frames to always have the same number of frames
+        self.frame_skips = frame_skips
+        # diff_type Decides the type of diff to use on the frames: 
+        # None does nothing
+        # 'first' subtracts the first frame from all other frames
+        # 'prev' subtracts the previous frame from each frame. I found this one to work best empirically
+        self.diff_type = diff_type 
         # keep mostly relevant frames from the image, as usually the first trim_percent frames is the
         # subject starring at the camera, motionless, and so are the last trim_percent frames, making
         # the output image noisy, or motionless
@@ -174,7 +185,6 @@ class Jester3DConvDataset(Dataset):
         video_id = self.video_ids[idx]
         label = self.labels[idx]
 
-        # SLOW PATH: Calculate from scratch
         video_dir = os.path.join(self.data_root, video_id)
 
         try:
@@ -185,21 +195,46 @@ class Jester3DConvDataset(Dataset):
             print("missed some image")
             return torch.zeros(1), label
 
-        total_frames = len(frame_names)
+        # If we are using the diff method, pop the first frame to later subtract it from every other image
+        # We do this before trimming to make sure that the person hadn't already started performing the gestuer in this frame
+        first_img = None
+        if self.diff_type == "first":
+            first_frame_name = frame_names.pop()
+            img_path = os.path.join(video_dir, first_frame_name)
+
+            with Image.open(img_path) as first_img:
+                first_img = first_img.convert("RGB")
+
+            # Resize/ToTensor happen here
+            if self.transform:
+                first_img = self.transform(first_img)
+
+        num_frames = len(frame_names)
 
         # Image trimming
         # calculate how many frames to drop from each side
-        cut_amount = int(total_frames * self.trim_percent)
+        cut_amount = int(num_frames * self.trim_percent)
         # it keeps everything if cut is 0.0 (means there aren't enough images to cut trim_percent*2 from)
         if cut_amount > 0:
             # revert to keeping only the middle frame if we cut too much (trim_percent >= 0.5)
-            if (total_frames - (2 * cut_amount)) <= 0:
-                mid = total_frames // 2
+            if (num_frames - (2 * cut_amount)) <= 0:
+                mid = num_frames // 2
                 frame_names = [frame_names[mid]]
             else:
                 # trim it up
                 frame_names = frame_names[cut_amount : -cut_amount]
 
+        prev_img = None
+        if self.diff_type == "prev":
+            prev_frame_name = frame_names.pop()
+            img_path = os.path.join(video_dir, prev_frame_name)
+
+            with Image.open(img_path) as prev_img:
+                prev_img = prev_img.convert("RGB")
+
+            # Resize/ToTensor happen here
+            if self.transform:
+                prev_img = self.transform(prev_img)
 
         # self.frames_available = len(frame_names)
         # debugging: seeing how many images are left, from how many there were (previous print)
@@ -207,7 +242,8 @@ class Jester3DConvDataset(Dataset):
 
         # Loading and Transforming the remaining frames
         tensors = []
-        for frame_name in frame_names:
+        for i in range(0, len(frame_names), self.frame_skips):
+            frame_name = frame_names[i]
             img_path = os.path.join(video_dir, frame_name)
 
             with Image.open(img_path) as img:
@@ -216,22 +252,30 @@ class Jester3DConvDataset(Dataset):
             # Resize/ToTensor happen here
             if self.transform:
                 img = self.transform(img)
-            tensors.append(img)
+
+            if self.diff_type == "first":
+                img_added = abs(img - first_img)
+            elif self.diff_type == "prev":
+                img_added = abs(img - prev_img)
+                prev_img = img
+            else:
+                img_added = img
+
+            tensors.append(img_added)
 
         # stack all frames. so  shape (num_frames, 3, H, W)
         stacked_video = torch.stack(tensors)
         
         # Pad or trim to a fixed number of frames (16 frames for consistency)
-        num_target_frames = 16
         num_frames = stacked_video.shape[0]
         
-        if num_frames < num_target_frames:
+        if num_frames < self.num_target_frames:
             # Pad with zeros if we have fewer frames
-            padding = torch.zeros(num_target_frames - num_frames, *stacked_video.shape[1:])
+            padding = torch.zeros(self.num_target_frames - num_frames, *stacked_video.shape[1:])
             stacked_video = torch.cat([stacked_video, padding], dim=0)
-        elif num_frames > num_target_frames:
+        elif num_frames > self.num_target_frames:
             # Randomly sample frames if we have more (or just take first 16)
-            indices = torch.linspace(0, num_frames - 1, num_target_frames).long()
+            indices = torch.linspace(0, num_frames - 1, self.num_target_frames).long()
             stacked_video = stacked_video[indices]
         
         # Permute to (C, D, H, W) format: (num_frames, 3, H, W) -> (3, num_frames, H, W)
@@ -311,7 +355,9 @@ def show_random_baseline_video(dataset):
     idx = random.randint(0, len(dataset) - 1)
 
     video_tensor, label_idx = dataset[idx]
-    for img_tensor in video_tensor:
+    # Permute the video tensor back to its original shape (num_frames, 3, H, W)
+    video_tensor = video_tensor.permute(1, 0, 2, 3)
+    for i, img_tensor in enumerate(video_tensor):
         # Matplotlib expects images in format (Height, Width, Channels)
         # so we permute dimensions: (3, H, W) -> (H, W, 3)
         img_view = img_tensor.permute(1, 2, 0).numpy()
@@ -323,28 +369,25 @@ def show_random_baseline_video(dataset):
 
         plt.figure(figsize=(4, 4))
         plt.imshow(img_view)
-        plt.title(f"Label: {label_text} (ID: {label_idx})\n'Shadowy' Mean Image")
+        plt.title(f"Label: {label_text} (ID: {label_idx})\n'Frame {i}")
         plt.axis('off')
         plt.show()
-
-
-
 
 # -------------------------------------------------
 
 class BasicBlock3D(nn.Module):
 
-    def __init__(self, in_channels, out_channels, stride=(1, 1, 1), downsample=None, expansion=1):
+    def __init__(self, in_channels, out_channels, stride, downsample, expansion_rate):
         super().__init__()
-        self.expansion = expansion
+        self.expansion_rate = expansion_rate
         # Define the first convolutional layer
         self.conv1 = self.factorized_conv(in_channels, out_channels, stride)
         self.bn1 = nn.BatchNorm3d(out_channels)
         self.relu = nn.ReLU(inplace=True)
 
         # Define the second convolutional layer (no stride)
-        self.conv2 = self.factorized_conv(out_channels, out_channels * self.expansion)
-        self.bn2 = nn.BatchNorm3d(out_channels * self.expansion)
+        self.conv2 = self.factorized_conv(out_channels, out_channels * self.expansion_rate)
+        self.bn2 = nn.BatchNorm3d(out_channels * self.expansion_rate)
 
         # Skip Connection (identity mapping or 1x1x1 conv for dimensionality match)
         self.downsample = downsample
@@ -398,9 +441,9 @@ class BasicBlock3D(nn.Module):
         # Combine them sequentially
         return nn.Sequential(spatial_conv, temporal_conv)
 class Resnet3DConvModel(nn.Module):
-    def __init__(self, num_blocks, img_channels=3, num_classes=27):
+    def __init__(self, num_blocks, expansion_rate, img_channels=3, num_classes=27):
         super().__init__()
-        self.expansion = 1
+        self.expansion_rate = expansion_rate
         self.in_channels = 64
         # 1. Initial 3D Convolution Layer
         # Kernel size is typically large spatially (7x7) and small temporally (3 or 5)
@@ -427,7 +470,7 @@ class Resnet3DConvModel(nn.Module):
         # Global Average Pooling over D, H, and W dimensions
         self.avgpool = nn.AdaptiveAvgPool3d((1, 1, 1))
 
-        final_channels = 512 * self.expansion
+        final_channels = 512 * self.expansion_rate
 
         self.fc = nn.Linear(final_channels, num_classes)
 
@@ -439,7 +482,7 @@ class Resnet3DConvModel(nn.Module):
 
         # Determine if a downsampling layer is needed
         downsample = None
-        channel_requirement = inter_channels * self.expansion
+        channel_requirement = inter_channels * self.expansion_rate
         if stride != (1, 1, 1) or self.in_channels != channel_requirement:
             downsample = nn.Sequential(
                 nn.Conv3d(
@@ -453,12 +496,12 @@ class Resnet3DConvModel(nn.Module):
             )
 
         # First block in the layer handles downsampling/channel change
-        layers.append(BasicBlock3D(self.in_channels, inter_channels, stride=stride, downsample=downsample))
-        self.in_channels = inter_channels * self.expansion
+        layers.append(BasicBlock3D(self.in_channels, inter_channels, stride=stride, downsample=downsample, expansion_rate=self.expansion_rate))
+        self.in_channels = inter_channels * self.expansion_rate
 
         # Remaining blocks maintain dimension
         for _ in range(num_blocks - 1):
-            layers.append(BasicBlock3D(self.in_channels, inter_channels, stride=(1, 1, 1), downsample=None))
+            layers.append(BasicBlock3D(self.in_channels, inter_channels, stride=(1, 1, 1), downsample=None, expansion_rate=self.expansion_rate))
 
         return nn.Sequential(*layers)
 
@@ -598,7 +641,10 @@ if __name__ == "__main__":
         rel_diff_cache_root)
 
 
-    trim_percent = 0.3  # found empirically to yield the best outputs (clearest shadows and images)
+    trim_percent = 0.2  # found empirically to yield the best outputs (clearest shadows and images)
+    num_target_frames = 14
+    frame_skips = 2
+    diff_type = "prev"
 
     transform = transforms.Compose([
         transforms.Resize((100, 150)),
@@ -610,6 +656,9 @@ if __name__ == "__main__":
         annotation_file=train_annotation,
         transform=transform,
         trim_percent=trim_percent,
+        num_target_frames=num_target_frames,
+        frame_skips=frame_skips,
+        diff_type=diff_type
     )
 
     # label map learned (generated) from the train videos: e.g. "Stop sign" is 1, and so on
@@ -622,6 +671,9 @@ if __name__ == "__main__":
         text_label_dict=label_map,
         # so the Validation loader does not generate new ones and turn everything on its head
         trim_percent=trim_percent,
+        num_target_frames=num_target_frames,
+        frame_skips=frame_skips,
+        diff_type=diff_type
     )
 
 
@@ -634,7 +686,7 @@ if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(device)
 
-    model = Resnet3DConvModel([3,4,6,3], img_channels=3, num_classes=27).to(device) # [3,4,6,3] is the number of Res-blocks of ResNet50
+    model = Resnet3DConvModel([2,2,2,2], 2, img_channels=3, num_classes=27).to(device) # [3,4,6,3] is the number of Res-blocks of ResNet50
 
     summary(model, input_size=(3, 16, 100, 150))
 
@@ -646,7 +698,7 @@ if __name__ == "__main__":
         num_workers = 2 # I have this temporarily I will just set it to 4 for me
     # some computers can handle 12 core usage, but (with the assumption that we're calculating for video processing) we might run into OOM
     # "Out of Memory" errors on the RAM side, not the VRAM side. Note that this is foe Data Loading only! inspect machine_limit.py file for more info
-    epochs = 40
+    epochs = 30
 
     train_loader = DataLoader(
         baseline_data_train,

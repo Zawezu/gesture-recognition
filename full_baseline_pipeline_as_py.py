@@ -952,7 +952,6 @@ if __name__ == "__main__":
         pin_memory=False
     )
 
-    model = TinyVGG(num_classes=27).to(device)
 
     train_losses, test_accuracies = train_model(
         model=model,
