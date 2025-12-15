@@ -683,20 +683,21 @@ def train_model(model, train_loader, test_loader, device, save_path, num_epochs=
 
 # -----------------------------------------------
 
-def load_model(checkpoint_path, model, optimizer=None, scheduler=None, scaler=None):
+def load_model(checkpoint_path, model):
+    print(f"\nLoading weights from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path)
-    model.load_state_dict(checkpoint["model"])
-    if optimizer: optimizer.load_state_dict(checkpoint["optimizer"])
-    if scheduler: scheduler.load_state_dict(checkpoint["scheduler"])
-    if scaler: scaler.load_state_dict(checkpoint["scaler"])
+    model.load_state_dict(checkpoint["model_state_dict"])
+    # optimizer.load_state_dict(checkpoint["optimizer_state_dict"])  # and we don't exactly need these for confusion matrices
+    # scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    # if scaler: scaler.load_state_dict(checkpoint["scaler"])  # I don't have a scheduler, but my partner does
 
 # ------------------------------------------------
 
 def generate_confusion_matrix(model, loader, device, idx_to_class, model_type, load_from=None):
     if load_from:  # If load from is not None, load the model from a checkpoint in order to keep training from there
-        print(f"Loading model from {load_from}")
         load_model(load_from, model)
 
+    model.to(device)
     model.eval()
 
     all_preds = []
@@ -718,10 +719,11 @@ def generate_confusion_matrix(model, loader, device, idx_to_class, model_type, l
 
     y_true = torch.cat(all_labels).numpy()
     y_pred = torch.cat(all_preds).numpy()
-    cm = confusion_matrix(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred)  # from scikit-learn
     cm_norm = cm.astype("float") / cm.sum(axis=1, keepdims=True)
 
-    class_names = [idx_to_class[i] for i in range(27)]
+    num_classes = len(idx_to_class)
+    class_names = [idx_to_class[i] for i in range(num_classes)]
 
     cm_df = pd.DataFrame(
         cm_norm,
@@ -734,14 +736,27 @@ def generate_confusion_matrix(model, loader, device, idx_to_class, model_type, l
         cm_df,
         cmap="Blues",
         annot=False,  # set True if you want numbers (can get cluttered)
-        fmt=".2f"
+        fmt=".2f",
+        xticklabels=class_names,
+        yticklabels=class_names
     )
 
-    plt.title(f"Confusion matrix for 3d conv model using {model_type}")
-    plt.xlabel("Predicted label")
-    plt.ylabel("True label")
+    plt.title(f"Confusion matrix for 3D conv model using {model_type}", fontsize=18, pad=20)
+    plt.xlabel("Predicted label", fontsize=14)
+    plt.ylabel("True label", fontsize=14)
+
+    # Rotated x-ticks and increased tick label size
+    plt.xticks(rotation=45, ha='right', fontsize=10) 
+    plt.yticks(fontsize=10)
+    
     plt.tight_layout()
+
+    filename = f"confusion_matrix_{model_type.replace(' ', '_').lower()}.png"
+    plt.savefig(filename)
+    print(f"Confusion matrix saved to {filename}")
+
     plt.show()
+    plt.close()
 
 # -----------------------------------------------
 
@@ -779,7 +794,7 @@ if __name__ == "__main__":
     }
 
     # variable to easily switch between caches and other (model, path) specific variables (Nico's idea, and a great one!)
-    cache_type = "rel_diff"  
+    cache_type = "unaltered"  
     match cache_type:
         case "diff":
             cache_dir = diff_cache_root
@@ -874,19 +889,25 @@ if __name__ == "__main__":
     )
 
     print("\nDiagnostics complete.")
-    input("Press Enter to start training (or Ctrl+C to stop)...")
-    train_losses, test_accuracies = train_model(
-        model=model,
-        train_loader=train_loader,
-        test_loader=val_loader,
-        device=device,
-        save_path=save_path,
-        num_epochs=epochs,
-        lr=0.001
-    )
+    # input("Press Enter to start training (or Ctrl+C to stop)...")
+    # train_losses, test_accuracies = train_model(
+    #     model=model,
+    #     train_loader=train_loader,
+    #     test_loader=val_loader,
+    #     device=device,
+    #     save_path=save_path,
+    #     num_epochs=epochs,
+    #     lr=0.001
+    # )
 
-    print(f"Finished with \nTrain_losses: {train_losses} \nTest_accuracies: {test_accuracies}")
+    # print(f"Finished with \nTrain_losses: {train_losses} \nTest_accuracies: {test_accuracies}")
+
+    print("Confusion matrix generation commencing. Attributes:")
+    print(f"Cache path: {cache_dir}")
+    print(f"Loading Model from: {save_path}")
+    print(f"idx_to_class map available: {True if label_map else False}")
+    input("Press Enter to start training (or Ctrl+C to stop)...")
 
     idx_to_class = {v: k for k, v in valid_3d_data.class_to_idx.items()}
-    generate_confusion_matrix(model, val_loader, device, idx_to_class, "unmodified frames",
-                              load_from="put checkpoint path here")
+    generate_confusion_matrix(model, val_loader, device, idx_to_class, "Unmodified frames",
+                              load_from=save_path)
