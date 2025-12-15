@@ -1,3 +1,7 @@
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+
 # Data importing, and integrity checking
 import os
 import pandas as pd
@@ -15,6 +19,7 @@ import torchvision.transforms as transforms
 
 # for visualizing shadowy images
 import matplotlib.pyplot as plt
+
 import numpy as np
 import random
 
@@ -649,7 +654,7 @@ def show_random_baseline_image(dataset):
     plt.show()
 
 
-# show_random_baseline_image(baseline_data_valid)
+
 
 # -------------------------------------------------
 
@@ -767,7 +772,7 @@ def calculate_test_accuracy(model, loader, device):
     return accuracy.item()
 
 
-def train_model(model, train_loader, test_loader, device, num_epochs=20, lr=0.001, checkpoint_interval=3, load_from=None):
+def train_model(model, train_loader, test_loader, device, num_epochs=30, lr=0.001, checkpoint_interval=3, load_from=None):
     model = model.to(device)
     loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = optim.AdamW(model.parameters(), lr=lr)
@@ -829,7 +834,7 @@ def train_model(model, train_loader, test_loader, device, num_epochs=20, lr=0.00
 
         if checkpoint_interval: # Only make checkpoints is checkpoint_interval is not 0
             if epoch % checkpoint_interval == 0:
-                checkpoint_path = f"{checkpoint_root}/baseline/checkpoint_{type(train_loader.dataset).__name__}_{epoch}_{val_accuracy*100}%"
+                checkpoint_path = f"{checkpoint_root}/baseline/checkpoint_{type(train_loader.dataset).__name__}_{epoch}_{val_accuracy}"
                 print(f"Creating checkpoint: {checkpoint_path}")
                 checkpoint = {
                     'model': model.state_dict(),
@@ -934,6 +939,8 @@ if __name__ == "__main__":
         cache_dir=rel_diff_cache_root
     )
 
+    show_random_baseline_image(baseline_data_valid)
+
     # if train_annotation, then val_annotation works too. This has to return SUCCESS, otherwise the class cannot access the data locations
     check_data_availability(train_annotation, video_root)
 
@@ -948,18 +955,21 @@ if __name__ == "__main__":
 
     summary(model, input_size=(3, 100, 150))
 
-    batch_size = 64
+    batch_size = 128
+    lr = 0.001
+
     print(device)
     if device == "cpu":
         num_workers = min(12, os.cpu_count() or 2)  # dynamic core loading; swap the hard limit (12) depending on the amount of ram available (<16)
     else:
-        num_workers = 2 # I have this temporarily I will just set it to 4 for me
+        num_workers = 8
     # some computers can handle 12 core usage, but (with the assumption that we're calculating for video processing) we might run into OOM
     # "Out of Memory" errors on the RAM side, not the VRAM side. Note that this is foe Data Loading only! inspect machine_limit.py file for more info
-    epochs = 21
+    epochs = 30
 
     # load_from = f"{checkpoint_root}/baseline/checkpoint_DataLoader_2"
     load_from = None
+    checkpoint_interval = 3
 
     train_loader = DataLoader(
         baseline_data_train,
@@ -980,15 +990,15 @@ if __name__ == "__main__":
         pin_memory=False
     )
 
-    train_losses, test_accuracies = train_model(
+    train_losses, val_accuracies = train_model(
         model=model,
         train_loader=train_loader,
         test_loader=val_loader,
         device=device,
         num_epochs=epochs,
-        lr=0.001,
-        checkpoint_interval=3,
+        lr=lr,
+        checkpoint_interval=checkpoint_interval,
         load_from=load_from
     )
 
-    print(f"Finished with \nTrain_losses: {train_losses} \nTest_accuracies: {test_accuracies}")
+    print(f"Finished with \nTrain_losses: {train_losses} \nVal_accuracies: {val_accuracies}")
